@@ -334,7 +334,10 @@ def migrate_db(env, state_dir, dry_run, docker_image=None):
         say(f"DRY RUN -- command file written to {load_path}, pgloader not run.")
         return True
 
-    say(f"Running pgloader ({load_path}) -- output streams live below.\n")
+    # Print the real command: it is the only unambiguous signal of whether the
+    # local binary or the Docker image is about to run.
+    say(f"Running: {' '.join(pgloader_cmd(state_dir, docker_image))}")
+    say("-- output streams live below.\n")
     t0 = time.time()
     lines = []
     cmd = pgloader_cmd(state_dir, docker_image)
