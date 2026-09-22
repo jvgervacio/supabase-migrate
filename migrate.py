@@ -56,15 +56,15 @@ DEFAULTS = {
     # what exhausts the SBCL heap on wide or BLOB-heavy tables.
     "PGLOADER_WORKERS": "", "PGLOADER_CONCURRENCY": "",
     "PGLOADER_PREFETCH_ROWS": "", "PGLOADER_BATCH_ROWS": "",
-    "PGLOADER_BATCH_SIZE": "", "PGLOADER_DYNAMIC_SPACE_MB": "",
+    "PGLOADER_BATCH_SIZE": "",
 }
 
-# What --low-memory applies: one reader, small batches, and a bigger Lisp heap
-# than the build default so a wide row still has room to land.
+# What --low-memory applies. The Lisp heap cannot be changed here -- it is
+# fixed when pgloader is built -- so this cuts what is held in memory.
 LOW_MEMORY = {
     "PGLOADER_WORKERS": "2", "PGLOADER_CONCURRENCY": "1",
     "PGLOADER_PREFETCH_ROWS": "1000", "PGLOADER_BATCH_ROWS": "1000",
-    "PGLOADER_BATCH_SIZE": "10MB", "PGLOADER_DYNAMIC_SPACE_MB": "4096",
+    "PGLOADER_BATCH_SIZE": "10MB",
 }
 
 SECRETS = []          # populated from the env file, masked in all output
@@ -290,21 +290,22 @@ def build_load_file(env, path):
     return text
 
 
-def pgloader_cmd(state_dir, docker_image=None, binary="pgloader", heap_mb=""):
+def pgloader_cmd(state_dir, docker_image=None, binary="pgloader"):
     """A pgloader binary (named, or on PATH), or a Docker run with the state
     dir mounted at /data.
 
     --network host is what lets 127.0.0.1:3306 inside the container reach
     MySQL on the host."""
     load_path = os.path.join(state_dir, "migrate.load")
-    # SBCL's heap is fixed at startup; --dynamic-space-size is the only way to
-    # raise it, and "Heap exhausted during garbage collection" needs it raised.
-    heap = ["--dynamic-space-size", str(heap_mb)] if str(heap_mb).strip() else []
+    # NOTE: SBCL's heap is fixed when the binary is built (pgloader's Makefile
+    # DYNSIZE, 16384 on Linux). pgloader's CLI has no --dynamic-space-size, so
+    # it cannot be set here -- passing it is rejected as an unknown option.
+    # Memory is controlled through the WITH clause instead; see with_opts().
     if not docker_image:
-        return [binary] + heap + [load_path]
+        return [binary, load_path]
     return ["docker", "run", "--rm", "--network", "host",
             "-v", f"{os.path.abspath(state_dir)}:/data",
-            docker_image, "pgloader"] + heap + ["/data/migrate.load"]
+            docker_image, "pgloader", "/data/migrate.load"]
 
 
 def preflight_db(env, docker_image=None, binary="pgloader"):
@@ -363,7 +364,6 @@ def preflight_db(env, docker_image=None, binary="pgloader"):
 
 
 def migrate_db(env, state_dir, dry_run, docker_image=None, binary="pgloader"):
-    heap_mb = env.get("PGLOADER_DYNAMIC_SPACE_MB", "").strip()
     head("DATABASE  MySQL -> Supabase Postgres")
     require(env, DB_KEYS, "database")
 
@@ -378,7 +378,7 @@ def migrate_db(env, state_dir, dry_run, docker_image=None, binary="pgloader"):
         say(f"DRY RUN -- command file written to {load_path}, pgloader not run.")
         return True
 
-    cmd = pgloader_cmd(state_dir, docker_image, binary, heap_mb)
+    cmd = pgloader_cmd(state_dir, docker_image, binary)
     # Print the real command: it is the only unambiguous signal of whether the
     # local binary or the Docker image is about to run, and with what heap.
     say(f"Running: {' '.join(cmd)}")
@@ -427,6 +427,24 @@ def migrate_db(env, state_dir, dry_run, docker_image=None, binary="pgloader"):
         say("  pgloader could not reach one of the databases.")
     if errors:
         say(f"  {errors} ERROR line(s) in the pgloader log -- review them above.")
+
+    # Ran out of memory: either SBCL filled its fixed heap, or the kernel's OOM
+    # killer took the process (exit -9 / 137). Different cause, same fix.
+    oom = ("Heap exhausted" in out or "gc invariant" in out
+           or proc.returncode in (-9, 137))
+    if oom:
+        say("\n  RAN OUT OF MEMORY while copying data.")
+        say("  pgloader prefetches 100k rows per thread by default. Retry with")
+        say("  --low-memory, which cuts that to 1000 and uses a single reader.")
+        if proc.returncode in (-9, 137):
+            say("  The kernel OOM killer stopped it, so the box itself ran out of RAM:")
+            say("    free -h                       # how much is actually available")
+            say("    sudo dmesg -T | grep -i 'killed process' | tail -3")
+        say("  The Lisp heap is fixed at build time (Makefile DYNSIZE, 16384 by")
+        say("  default -- larger than most servers). To cap it below your RAM:")
+        say("    cd pgloader-bundle-3.6.9 && rm -f bin/pgloader && make DYNSIZE=2048")
+        say("  A smaller heap makes SBCL collect garbage instead of growing until")
+        say("  the kernel intervenes.")
 
     # pgloader writes every rejected row, with the reason, under a directory it
     # mentions once at startup and never again. Nobody finds it. Surface it.
