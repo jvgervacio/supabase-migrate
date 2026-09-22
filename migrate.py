@@ -51,6 +51,20 @@ DEFAULTS = {
     "AWS_REGION": "us-east-1", "SUPABASE_REGION": "us-east-1",
     "SOURCE_PREFIX": "", "TARGET_PREFIX": "", "TARGET_SCHEMA": "",
     "AWS_SESSION_TOKEN": "", "MAX_FILE_MB": "50", "WORKERS": "8",
+    # pgloader tuning. Empty means "leave pgloader's default alone".
+    # Its defaults prefetch 100k rows per thread across 4 workers, which is
+    # what exhausts the SBCL heap on wide or BLOB-heavy tables.
+    "PGLOADER_WORKERS": "", "PGLOADER_CONCURRENCY": "",
+    "PGLOADER_PREFETCH_ROWS": "", "PGLOADER_BATCH_ROWS": "",
+    "PGLOADER_BATCH_SIZE": "", "PGLOADER_DYNAMIC_SPACE_MB": "",
+}
+
+# What --low-memory applies: one reader, small batches, and a bigger Lisp heap
+# than the build default so a wide row still has room to land.
+LOW_MEMORY = {
+    "PGLOADER_WORKERS": "2", "PGLOADER_CONCURRENCY": "1",
+    "PGLOADER_PREFETCH_ROWS": "1000", "PGLOADER_BATCH_ROWS": "1000",
+    "PGLOADER_BATCH_SIZE": "10MB", "PGLOADER_DYNAMIC_SPACE_MB": "4096",
 }
 
 SECRETS = []          # populated from the env file, masked in all output
@@ -221,6 +235,23 @@ def port_open(host, port, timeout=6):
 # Part 1 -- MySQL to Supabase Postgres
 # ==========================================================================
 
+def with_opts(env):
+    """The WITH clause: behaviour flags plus any memory tuning that is set.
+
+    pgloader's defaults prefetch 100k rows per thread over 4 workers, which is
+    what exhausts the SBCL heap on wide or BLOB-heavy tables."""
+    opts = ["create tables", "create indexes", "reset sequences", "foreign keys"]
+    for key, clause in [("PGLOADER_WORKERS", "workers"),
+                        ("PGLOADER_CONCURRENCY", "concurrency"),
+                        ("PGLOADER_PREFETCH_ROWS", "prefetch rows"),
+                        ("PGLOADER_BATCH_ROWS", "batch rows"),
+                        ("PGLOADER_BATCH_SIZE", "batch size")]:
+        val = env.get(key, "").strip()
+        if val:
+            opts.append(f"{clause} = {val}")
+    return opts
+
+
 def build_load_file(env, path):
     """Write a pgloader command file. Passwords are percent-encoded here, so
     a '@' or '/' in a password does not corrupt the connection URL."""
@@ -242,7 +273,7 @@ def build_load_file(env, path):
         f"     FROM {my}",
         f"     INTO {pg}",
         "",
-        "WITH create tables, create indexes, reset sequences, foreign keys",
+        "WITH " + ", ".join(with_opts(env)),
         "",
         "SET work_mem to '256MB', statement_timeout to '0'",
         "",
@@ -259,18 +290,21 @@ def build_load_file(env, path):
     return text
 
 
-def pgloader_cmd(state_dir, docker_image=None, binary="pgloader"):
+def pgloader_cmd(state_dir, docker_image=None, binary="pgloader", heap_mb=""):
     """A pgloader binary (named, or on PATH), or a Docker run with the state
     dir mounted at /data.
 
     --network host is what lets 127.0.0.1:3306 inside the container reach
     MySQL on the host."""
     load_path = os.path.join(state_dir, "migrate.load")
+    # SBCL's heap is fixed at startup; --dynamic-space-size is the only way to
+    # raise it, and "Heap exhausted during garbage collection" needs it raised.
+    heap = ["--dynamic-space-size", str(heap_mb)] if str(heap_mb).strip() else []
     if not docker_image:
-        return [binary, load_path]
+        return [binary] + heap + [load_path]
     return ["docker", "run", "--rm", "--network", "host",
             "-v", f"{os.path.abspath(state_dir)}:/data",
-            docker_image, "pgloader", "/data/migrate.load"]
+            docker_image, "pgloader"] + heap + ["/data/migrate.load"]
 
 
 def preflight_db(env, docker_image=None, binary="pgloader"):
@@ -329,6 +363,7 @@ def preflight_db(env, docker_image=None, binary="pgloader"):
 
 
 def migrate_db(env, state_dir, dry_run, docker_image=None, binary="pgloader"):
+    heap_mb = env.get("PGLOADER_DYNAMIC_SPACE_MB", "").strip()
     head("DATABASE  MySQL -> Supabase Postgres")
     require(env, DB_KEYS, "database")
 
@@ -343,13 +378,13 @@ def migrate_db(env, state_dir, dry_run, docker_image=None, binary="pgloader"):
         say(f"DRY RUN -- command file written to {load_path}, pgloader not run.")
         return True
 
+    cmd = pgloader_cmd(state_dir, docker_image, binary, heap_mb)
     # Print the real command: it is the only unambiguous signal of whether the
-    # local binary or the Docker image is about to run.
-    say(f"Running: {' '.join(pgloader_cmd(state_dir, docker_image, binary))}")
+    # local binary or the Docker image is about to run, and with what heap.
+    say(f"Running: {' '.join(cmd)}")
     say("-- output streams live below.\n")
     t0 = time.time()
     lines = []
-    cmd = pgloader_cmd(state_dir, docker_image, binary)
     try:
         # Streamed, not captured: a long migration must show progress as it
         # happens rather than printing everything once it is over.
@@ -392,6 +427,30 @@ def migrate_db(env, state_dir, dry_run, docker_image=None, binary="pgloader"):
         say("  pgloader could not reach one of the databases.")
     if errors:
         say(f"  {errors} ERROR line(s) in the pgloader log -- review them above.")
+
+    # pgloader writes every rejected row, with the reason, under a directory it
+    # mentions once at startup and never again. Nobody finds it. Surface it.
+    m = re.search(r"Data errors in '([^']+)'", out)
+    if m and (failed or errors):
+        d = m.group(1)
+        say(f"\n  Rejected rows are written under {d}")
+        try:
+            found = []
+            for root, _, files in os.walk(d):
+                for f in files:
+                    p = os.path.join(root, f)
+                    if os.path.getsize(p) > 0:
+                        found.append((p, os.path.getsize(p)))
+            for p, size in sorted(found, key=lambda x: -x[1])[:10]:
+                say(f"    {human(size):>10}  {p}")
+            if found:
+                say("  Each .dat holds the rejected rows; the matching .log says why:")
+                say(f"    head -20 {sorted(found, key=lambda x: -x[1])[0][0]}")
+            else:
+                say("    (empty -- the failure was not per-row; see the ERROR lines above)")
+        except OSError as e:
+            say(f"    (could not read it: {e})")
+
     say("Database migration FAILED." if failed else "Database migration finished.")
     return not failed
 
@@ -894,6 +953,11 @@ settings:
                          "binary (default image: dimitri/pgloader:latest).\n"
                          "Needed on Ubuntu 20.04, whose pgloader 3.6.1/3.6.2\n"
                          "cannot do the SCRAM-SHA-256 auth Supabase requires.")
+    ap.add_argument("--low-memory", action="store_true",
+                    help="throttle pgloader for a small server: 2 workers,\n"
+                         "1 reader, 1000-row batches and a 4 GB Lisp heap.\n"
+                         "Use when the data copy dies with 'Heap exhausted'\n"
+                         "or the OOM killer. Slower, far less memory.")
     ap.add_argument("--debug", action="store_true",
                     help="print full tracebacks to the console as failures\n"
                          "happen, not only to failures.log")
@@ -909,6 +973,14 @@ settings:
         env = load_env(args.env)
         os.makedirs(args.state_dir, exist_ok=True)
         open_log(os.path.join(args.state_dir, "migrate.log"))
+
+        if args.low_memory:
+            # Fill in only what the env file leaves unset, so an explicit
+            # value in the file still wins over the preset.
+            applied = {k: v for k, v in LOW_MEMORY.items() if not env.get(k, "").strip()}
+            env.update(applied)
+            say("low-memory mode: " + ", ".join(f"{k.replace('PGLOADER_', '').lower()}"
+                                                f"={v}" for k, v in sorted(applied.items())))
         workers = args.workers or as_num(env, "WORKERS")
         if workers < 1:
             raise Fatal(f"WORKERS must be at least 1, got {workers}")
