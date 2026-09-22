@@ -859,12 +859,25 @@ settings:
         say(f"state dir  {args.state_dir}")
         say(f"scope      {args.only}")
 
+        def phase(name, fn):
+            """Run one half. A Fatal here fails only this half: with --only all,
+            a missing pgloader must not stop the storage transfer from running."""
+            try:
+                results[name] = fn()
+            except Fatal as e:
+                results[name] = False
+                say(f"\nERROR ({name}): {e}")
+                if DEBUG:
+                    say(traceback.format_exc())
+
         results = {}
         if args.only in ("db", "all") and not args.verify_only:
-            results["database"] = migrate_db(env, args.state_dir, args.dry_run)
+            phase("database",
+                  lambda: migrate_db(env, args.state_dir, args.dry_run))
         if args.only in ("storage", "all"):
-            results["storage"] = migrate_storage(env, args.state_dir, args.dry_run,
-                                                 args.verify_only, workers)
+            phase("storage",
+                  lambda: migrate_storage(env, args.state_dir, args.dry_run,
+                                          args.verify_only, workers))
 
         head("SUMMARY")
         if not results:
