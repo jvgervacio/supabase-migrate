@@ -859,18 +859,21 @@ settings:
         say(f"state dir  {args.state_dir}")
         say(f"scope      {args.only}")
 
+        results, fatals = {}, []
+
         def phase(name, fn):
             """Run one half. A Fatal here fails only this half: with --only all,
-            a missing pgloader must not stop the storage transfer from running."""
+            a missing pgloader must not stop the storage transfer from running.
+            It is still recorded, so the run exits 2 (bad settings / preflight)
+            rather than 1 (ran, with failures)."""
             try:
                 results[name] = fn()
             except Fatal as e:
                 results[name] = False
+                fatals.append(name)
                 say(f"\nERROR ({name}): {e}")
                 if DEBUG:
                     say(traceback.format_exc())
-
-        results = {}
         if args.only in ("db", "all") and not args.verify_only:
             phase("database",
                   lambda: migrate_db(env, args.state_dir, args.dry_run))
@@ -889,6 +892,8 @@ settings:
             say("\nDry run only -- nothing was written. Rerun without --dry-run.")
         if _LOG_PATH:
             say(f"\nFull transcript: {_LOG_PATH}")
+        if fatals:
+            return 2          # settings or preflight problem, per --help
         return 0 if all(results.values()) else 1
 
     except Fatal as e:
