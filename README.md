@@ -63,7 +63,7 @@ seconds rather than partway through a transfer:
   sudo apt-get install -y sbcl unzip libsqlite3-dev gawk curl make freetds-dev libzip-dev
   curl -fsSL https://github.com/dimitri/pgloader/archive/refs/tags/v3.6.9.tar.gz | tar xz
   make -C pgloader-3.6.9
-  python3 migrate.py --env migration.env --only db       --pgloader pgloader-3.6.9/build/bin/pgloader
+  python3 migrate.py --env migration.env --only db --pgloader pgloader-3.6.9/build/bin/pgloader
   ```
 
   ```bash
