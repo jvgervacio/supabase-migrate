@@ -39,9 +39,23 @@ seconds rather than partway through a transfer:
 
 ## Requirements
 
-- Python 3.6+
-- `boto3` — `pip3 install --upgrade boto3` (storage half only)
-- `pgloader` — `sudo apt-get install -y pgloader` (database half only)
+- **Python 3.6+** — everything else the script uses is standard library
+- **`boto3`** — storage half only:
+
+  ```bash
+  pip3 install -r requirements.txt
+  ```
+
+- **`pgloader`** — database half only, a system package rather than a pip install:
+
+  ```bash
+  sudo apt-get install -y pgloader
+  ```
+
+  Ubuntu 20.04 ships 3.6.2, which does not support MySQL 8's default
+  `utf8mb4_0900_ai_ci` collation. Check with
+  `mysql -e "SELECT @@collation_database"`; if that is what you have, install a
+  newer build from `apt.postgresql.org` instead.
 
 Run it **on the database server**. MySQL usually accepts connections only from
 `127.0.0.1`, which sidesteps the firewall, the `bind-address` setting and the
