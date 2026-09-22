@@ -259,7 +259,20 @@ def build_load_file(env, path):
     return text
 
 
-def preflight_db(env):
+def pgloader_cmd(state_dir, docker_image):
+    """Local binary, or a Docker run with the state dir mounted at /data.
+
+    --network host is what lets 127.0.0.1:3306 inside the container reach
+    MySQL on the host."""
+    load_path = os.path.join(state_dir, "migrate.load")
+    if not docker_image:
+        return ["pgloader", load_path]
+    return ["docker", "run", "--rm", "--network", "host",
+            "-v", f"{os.path.abspath(state_dir)}:/data",
+            docker_image, "pgloader", "/data/migrate.load"]
+
+
+def preflight_db(env, docker_image=None):
     ok = True
 
     host, port = env["MYSQL_HOST"], env["MYSQL_PORT"]
@@ -282,22 +295,35 @@ def preflight_db(env):
         say("      Port 6543 is transaction mode: no session SET, no prepared")
         say("      statements. pgloader needs both. Use SUPABASE_DB_PORT=5432.")
 
-    if not shutil.which("pgloader"):
+    if docker_image:
+        if not shutil.which("docker"):
+            ok = False
+            say("  docker -- not installed, but --pgloader-docker was requested")
+        else:
+            say(f"  pgloader -- via Docker image {docker_image}")
+    elif not shutil.which("pgloader"):
         ok = False
         say("  pgloader -- not installed. Install it with:")
         say("      sudo apt-get update && sudo apt-get install -y pgloader")
     else:
         ver = subprocess.run(["pgloader", "--version"], capture_output=True, text=True)
-        say(f"  pgloader -- {ver.stdout.strip() or ver.stderr.strip()}")
+        text = (ver.stdout or "") + (ver.stderr or "")
+        say(f"  pgloader -- {text.strip().splitlines()[0] if text.strip() else 'unknown'}")
+        # 3.6.1/3.6.2 ship a Postgres library predating SCRAM-SHA-256, which
+        # Supabase requires. It fails late and cryptically, so flag it now.
+        m = re.search(r'"(\d+)\.(\d+)\.(\d+)"', text)
+        if m and tuple(int(g) for g in m.groups()) < (3, 6, 3):
+            say("      This version predates SCRAM-SHA-256 support and will fail")
+            say("      against Supabase. Rerun with --pgloader-docker.")
 
     return ok
 
 
-def migrate_db(env, state_dir, dry_run):
+def migrate_db(env, state_dir, dry_run, docker_image=None):
     head("DATABASE  MySQL -> Supabase Postgres")
     require(env, DB_KEYS, "database")
 
-    if not preflight_db(env):
+    if not preflight_db(env, docker_image):
         raise Fatal("database preflight failed -- fix the errors above")
 
     load_path = os.path.join(state_dir, "migrate.load")
@@ -311,15 +337,17 @@ def migrate_db(env, state_dir, dry_run):
     say(f"Running pgloader ({load_path}) -- output streams live below.\n")
     t0 = time.time()
     lines = []
+    cmd = pgloader_cmd(state_dir, docker_image)
     try:
         # Streamed, not captured: a long migration must show progress as it
         # happens rather than printing everything once it is over.
         try:
-            proc = subprocess.Popen(["pgloader", load_path], stdout=subprocess.PIPE,
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
         except FileNotFoundError:
-            raise Fatal("pgloader is not installed or not on PATH. Install it with:\n"
-                        "    sudo apt-get update && sudo apt-get install -y pgloader")
+            raise Fatal(f"{cmd[0]} is not installed or not on PATH. Install it with:\n"
+                        "    sudo apt-get update && sudo apt-get install -y pgloader\n"
+                        "or rerun with --pgloader-docker to use the official image.")
         for line in proc.stdout:
             line = line.rstrip("\n")
             lines.append(line)
@@ -341,7 +369,14 @@ def migrate_db(env, state_dir, dry_run):
     unreachable = "Failed to connect" in out
     failed = proc.returncode != 0 or unreachable or errors > 0
 
-    if unreachable:
+    if "fell through ECASE" in out:
+        # Postgres auth type 10 is SCRAM-SHA-256. pgloader 3.6.1/3.6.2 handle
+        # only (0 2 3 4 5 6 7 8), and Supabase requires SCRAM.
+        say("  This pgloader is too old for Supabase. That ECASE error is Postgres")
+        say("  auth type 10 -- SCRAM-SHA-256 -- which its bundled library cannot do.")
+        say("  Ubuntu ships 3.6.1/3.6.2; SCRAM needs a newer build. Rerun with:")
+        say("      python3 migrate.py --env <envfile> --only db --pgloader-docker")
+    elif unreachable:
         say("  pgloader could not reach one of the databases.")
     if errors:
         say(f"  {errors} ERROR line(s) in the pgloader log -- review them above.")
@@ -789,6 +824,9 @@ examples:
   migrate.py --env migration.env
   migrate.py --env migration.env --verify-only
 
+  # Ubuntu 20.04: its pgloader is too old for Supabase's SCRAM auth
+  migrate.py --env migration.env --only db --pgloader-docker
+
   # a failed run: retry, watching stacks as they happen
   migrate.py --env migration.env --only storage --debug
 
@@ -834,6 +872,12 @@ settings:
                     help="parallel storage transfers, overriding WORKERS in\n"
                          "the env file (default: 8). Lower it if Supabase\n"
                          "starts returning 429.")
+    ap.add_argument("--pgloader-docker", nargs="?", const="dimitri/pgloader:latest",
+                    metavar="IMAGE",
+                    help="run pgloader from a Docker image instead of the local\n"
+                         "binary (default image: dimitri/pgloader:latest).\n"
+                         "Needed on Ubuntu 20.04, whose pgloader 3.6.1/3.6.2\n"
+                         "cannot do the SCRAM-SHA-256 auth Supabase requires.")
     ap.add_argument("--debug", action="store_true",
                     help="print full tracebacks to the console as failures\n"
                          "happen, not only to failures.log")
@@ -876,7 +920,8 @@ settings:
                     say(traceback.format_exc())
         if args.only in ("db", "all") and not args.verify_only:
             phase("database",
-                  lambda: migrate_db(env, args.state_dir, args.dry_run))
+                  lambda: migrate_db(env, args.state_dir, args.dry_run,
+                                     args.pgloader_docker))
         if args.only in ("storage", "all"):
             phase("storage",
                   lambda: migrate_storage(env, args.state_dir, args.dry_run,
