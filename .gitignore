@@ -1,0 +1,25 @@
+# Live credentials -- never commit. Only migration.env.example belongs here.
+migration.env
+*.env
+!*.env.example
+
+# Run artefacts: transcript, manifest, resume log, failure tracebacks,
+# and the generated pgloader command file (which contains passwords).
+migration_state/
+*.load
+*.log
+s3_inventory.csv
+s3_migrated.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
