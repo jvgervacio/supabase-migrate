@@ -365,6 +365,7 @@ def s3_clients(env):
     asec = env["AWS_SECRET_ACCESS_KEY"]
     sb_id = env["SUPABASE_ACCESS_KEY_ID"]
     sb_sec = env["SUPABASE_SECRET_ACCESS_KEY"]
+    bad_keys = []          # names of credentials whose shape is already wrong
 
     for name, val, size in [("AWS_ACCESS_KEY_ID", akid, 20),
                             ("AWS_SECRET_ACCESS_KEY", asec, 40),
@@ -372,6 +373,7 @@ def s3_clients(env):
                             ("SUPABASE_SECRET_ACCESS_KEY", sb_sec, 64)]:
         if len(val) != size:
             say(f"  warn: {name} is {len(val)} chars, expected {size}")
+            bad_keys.append(name)
 
     # Copying from the Supabase dashboard easily grabs both fields at once and
     # leaves the key id stuck on the end of the secret. It fails later as an
@@ -411,7 +413,7 @@ def s3_clients(env):
         aws_access_key_id=env["SUPABASE_ACCESS_KEY_ID"],
         aws_secret_access_key=env["SUPABASE_SECRET_ACCESS_KEY"],
         region_name=env["SUPABASE_REGION"], config=cfg)
-    return src, dst
+    return src, dst, bad_keys
 
 
 def explain_s3_error(env, e):
@@ -451,7 +453,7 @@ def dest_key(env, key):
     return f"{target}/{k}" if target else k
 
 
-def preflight_storage(env, src, dst):
+def preflight_storage(env, src, dst, bad_keys=()):
     from botocore.exceptions import ClientError, EndpointConnectionError
     ok = True
     prefix = env.get("SOURCE_PREFIX", "").lstrip("/")
@@ -475,8 +477,23 @@ def preflight_storage(env, src, dst):
     except (ClientError, EndpointConnectionError) as e:
         ok = False
         say(f"  FAIL destination: {e}")
-        say("      Check the endpoint ends in /storage/v1/s3, the region matches the")
-        say("      project, and the S3 access keys are current.")
+        code = (getattr(e, "response", {}) or {}).get("Error", {}).get("Code", "")
+        if bad_keys:
+            # The shape warnings above are almost certainly the cause -- say so
+            # rather than making the reader connect two separate messages.
+            say(f"      Fix the key warning(s) above first: {', '.join(bad_keys)}.")
+            say("      A malformed secret cannot produce a valid signature, so this")
+            say("      failure is expected until the key is corrected.")
+        elif not code:
+            # Supabase answers a bad signature with a non-S3 body, which botocore
+            # surfaces as an empty code rather than SignatureDoesNotMatch.
+            say("      Empty error code: the endpoint returned something that is not")
+            say("      an S3 error. Usually a rejected signature -- re-copy")
+            say("      SUPABASE_ACCESS_KEY_ID (32 chars) and")
+            say("      SUPABASE_SECRET_ACCESS_KEY (64 chars) as separate fields.")
+        else:
+            say("      Check the endpoint ends in /storage/v1/s3, the region matches")
+            say("      the project, and the S3 access keys are current.")
     return ok
 
 
@@ -718,8 +735,8 @@ def migrate_storage(env, state_dir, dry_run, verify_only, workers):
     head("STORAGE  Amazon S3 -> Supabase Storage")
     require(env, STORAGE_KEYS, "storage")
 
-    src, dst = s3_clients(env)
-    if not preflight_storage(env, src, dst):
+    src, dst, bad_keys = s3_clients(env)
+    if not preflight_storage(env, src, dst, bad_keys):
         raise Fatal("storage preflight failed -- fix the errors above")
 
     if verify_only:
