@@ -259,20 +259,21 @@ def build_load_file(env, path):
     return text
 
 
-def pgloader_cmd(state_dir, docker_image):
-    """Local binary, or a Docker run with the state dir mounted at /data.
+def pgloader_cmd(state_dir, docker_image=None, binary="pgloader"):
+    """A pgloader binary (named, or on PATH), or a Docker run with the state
+    dir mounted at /data.
 
     --network host is what lets 127.0.0.1:3306 inside the container reach
     MySQL on the host."""
     load_path = os.path.join(state_dir, "migrate.load")
     if not docker_image:
-        return ["pgloader", load_path]
+        return [binary, load_path]
     return ["docker", "run", "--rm", "--network", "host",
             "-v", f"{os.path.abspath(state_dir)}:/data",
             docker_image, "pgloader", "/data/migrate.load"]
 
 
-def preflight_db(env, docker_image=None):
+def preflight_db(env, docker_image=None, binary="pgloader"):
     ok = True
 
     host, port = env["MYSQL_HOST"], env["MYSQL_PORT"]
@@ -301,29 +302,37 @@ def preflight_db(env, docker_image=None):
             say("  docker -- not installed, but --pgloader-docker was requested")
         else:
             say(f"  pgloader -- via Docker image {docker_image}")
-    elif not shutil.which("pgloader"):
+    elif not (shutil.which(binary) or os.path.isfile(binary)):
         ok = False
-        say("  pgloader -- not installed. Install it with:")
-        say("      sudo apt-get update && sudo apt-get install -y pgloader")
+        say(f"  pgloader -- '{binary}' not found. Either install it, build it")
+        say("      from source and pass --pgloader <path>, or use --pgloader-docker.")
     else:
-        ver = subprocess.run(["pgloader", "--version"], capture_output=True, text=True)
-        text = (ver.stdout or "") + (ver.stderr or "")
-        say(f"  pgloader -- {text.strip().splitlines()[0] if text.strip() else 'unknown'}")
+        try:
+            ver = subprocess.run([binary, "--version"], capture_output=True, text=True)
+            text = (ver.stdout or "") + (ver.stderr or "")
+        except OSError as e:
+            ok = False
+            say(f"  pgloader -- cannot run '{binary}': {e}")
+            text = ""
+        if text.strip():
+            say(f"  pgloader -- {text.strip().splitlines()[0]}  [{binary}]")
         # 3.6.1/3.6.2 ship a Postgres library predating SCRAM-SHA-256, which
         # Supabase requires. It fails late and cryptically, so flag it now.
         m = re.search(r'"(\d+)\.(\d+)\.(\d+)"', text)
         if m and tuple(int(g) for g in m.groups()) < (3, 6, 3):
-            say("      This version predates SCRAM-SHA-256 support and will fail")
-            say("      against Supabase. Rerun with --pgloader-docker.")
+            ok = False
+            say("      This version predates SCRAM-SHA-256 and WILL fail against")
+            say("      Supabase. Build 3.6.9 from source and pass --pgloader <path>,")
+            say("      or use --pgloader-docker.")
 
     return ok
 
 
-def migrate_db(env, state_dir, dry_run, docker_image=None):
+def migrate_db(env, state_dir, dry_run, docker_image=None, binary="pgloader"):
     head("DATABASE  MySQL -> Supabase Postgres")
     require(env, DB_KEYS, "database")
 
-    if not preflight_db(env, docker_image):
+    if not preflight_db(env, docker_image, binary):
         raise Fatal("database preflight failed -- fix the errors above")
 
     load_path = os.path.join(state_dir, "migrate.load")
@@ -336,11 +345,11 @@ def migrate_db(env, state_dir, dry_run, docker_image=None):
 
     # Print the real command: it is the only unambiguous signal of whether the
     # local binary or the Docker image is about to run.
-    say(f"Running: {' '.join(pgloader_cmd(state_dir, docker_image))}")
+    say(f"Running: {' '.join(pgloader_cmd(state_dir, docker_image, binary))}")
     say("-- output streams live below.\n")
     t0 = time.time()
     lines = []
-    cmd = pgloader_cmd(state_dir, docker_image)
+    cmd = pgloader_cmd(state_dir, docker_image, binary)
     try:
         # Streamed, not captured: a long migration must show progress as it
         # happens rather than printing everything once it is over.
@@ -875,6 +884,10 @@ settings:
                     help="parallel storage transfers, overriding WORKERS in\n"
                          "the env file (default: 8). Lower it if Supabase\n"
                          "starts returning 429.")
+    ap.add_argument("--pgloader", default="pgloader", metavar="PATH",
+                    help="path to the pgloader binary (default: pgloader on\n"
+                         "PATH). Use this after building 3.6.9 from source:\n"
+                         "  --pgloader ~/pgloader-3.6.9/build/bin/pgloader")
     ap.add_argument("--pgloader-docker", nargs="?", const="dimitri/pgloader:latest",
                     metavar="IMAGE",
                     help="run pgloader from a Docker image instead of the local\n"
@@ -924,7 +937,7 @@ settings:
         if args.only in ("db", "all") and not args.verify_only:
             phase("database",
                   lambda: migrate_db(env, args.state_dir, args.dry_run,
-                                     args.pgloader_docker))
+                                     args.pgloader_docker, args.pgloader))
         if args.only in ("storage", "all"):
             phase("storage",
                   lambda: migrate_storage(env, args.state_dir, args.dry_run,

@@ -52,10 +52,26 @@ seconds rather than partway through a transfer:
   sudo apt-get install -y pgloader
   ```
 
-  Ubuntu 20.04 ships 3.6.2, which does not support MySQL 8's default
-  `utf8mb4_0900_ai_ci` collation. Check with
-  `mysql -e "SELECT @@collation_database"`; if that is what you have, install a
-  newer build from `apt.postgresql.org` instead.
+  **Ubuntu 20.04 users:** the packaged 3.6.1/3.6.2 cannot do SCRAM-SHA-256,
+  the authentication Supabase requires, and fails with `10 fell through ECASE
+  expression`. PostgreSQL's own apt repo has no pgloader for focal, and the
+  jammy `.deb` needs `libc6 >= 2.34` which focal does not have. Two ways round
+  it:
+
+  ```bash
+  # build 3.6.9 from source (~10 min, no service left running)
+  sudo apt-get install -y sbcl unzip libsqlite3-dev gawk curl make freetds-dev libzip-dev
+  curl -fsSL https://github.com/dimitri/pgloader/archive/refs/tags/v3.6.9.tar.gz | tar xz
+  make -C pgloader-3.6.9
+  python3 migrate.py --env migration.env --only db       --pgloader pgloader-3.6.9/build/bin/pgloader
+  ```
+
+  ```bash
+  # or use the official image
+  python3 migrate.py --env migration.env --only db --pgloader-docker
+  ```
+
+  Preflight reads the version and refuses to run anything older than 3.6.3.
 
 Run it **on the database server**. MySQL usually accepts connections only from
 `127.0.0.1`, which sidesteps the firewall, the `bind-address` setting and the
