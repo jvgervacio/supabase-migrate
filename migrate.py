@@ -18,6 +18,7 @@ Storage transfers resume: completed keys are recorded and skipped on a rerun.
 import argparse
 import csv
 import datetime
+import hashlib
 import json
 import mimetypes
 import os
@@ -568,13 +569,54 @@ def explain_s3_error(env, e):
     return f"Unexpected error code {code!r}."
 
 
-def dest_key(env, key):
+# Supabase Storage rejects any object key outside this allowlist with an
+# "InvalidKey" error that arrives through the S3 protocol as an empty code.
+SUPABASE_KEY_OK = re.compile(r"^[A-Za-z0-9_/!.*'() &$=@;:+,?-]*$")
+
+# Common letters that transliterate cleanly; anything else becomes '-'.
+TRANSLIT = str.maketrans({
+    "á": "a", "à": "a", "â": "a", "ä": "a", "ã": "a", "å": "a", "ă": "a",
+    "é": "e", "è": "e", "ê": "e", "ë": "e", "í": "i", "ì": "i", "î": "i",
+    "ï": "i", "ó": "o", "ò": "o", "ô": "o", "ö": "o", "õ": "o", "ō": "o",
+    "ú": "u", "ù": "u", "û": "u", "ü": "u", "ñ": "n", "ç": "c", "ß": "ss",
+    "Á": "A", "À": "A", "Â": "A", "Ä": "A", "Ã": "A", "Å": "A", "Ă": "A",
+    "É": "E", "È": "E", "Ê": "E", "Ë": "E", "Í": "I", "Ì": "I", "Î": "I",
+    "Ï": "I", "Ó": "O", "Ò": "O", "Ô": "O", "Ö": "O", "Õ": "O", "Ō": "O",
+    "Ú": "U", "Ù": "U", "Û": "U", "Ü": "U", "Ñ": "N", "Ç": "C",
+})
+
+
+def sanitize_key(key):
+    """Make a key Supabase will accept. Returns it unchanged if already valid."""
+    if SUPABASE_KEY_OK.match(key):
+        return key
+    out = "".join(
+        c if SUPABASE_KEY_OK.match(c) else "-"
+        for c in key.translate(TRANSLIT)
+    )
+    out = re.sub(r"-{2,}", "-", out)          # collapse runs from CJK etc.
+
+    # A name with nothing left of it (all-CJK, say) would collide with every
+    # other such name and silently overwrite. Give it the original's digest.
+    head_, _, base = out.rpartition("/")
+    stem, dot, ext = base.rpartition(".")
+    if not dot:
+        stem, ext = base, ""
+    if not re.search(r"[A-Za-z0-9]", stem):
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+        base = f"{digest}{dot}{ext}" if dot else digest
+        out = f"{head_}/{base}" if head_ else base
+    return out
+
+
+def dest_key(env, key, sanitize=False):
     k = key.lstrip("/")
     prefix = env.get("SOURCE_PREFIX", "").lstrip("/")
     if prefix and k.startswith(prefix):
         k = k[len(prefix):].lstrip("/")
     target = env.get("TARGET_PREFIX", "").strip().strip("/")
-    return f"{target}/{k}" if target else k
+    k = f"{target}/{k}" if target else k
+    return sanitize_key(k) if sanitize else k
 
 
 def preflight_storage(env, src, dst, bad_keys=()):
@@ -621,7 +663,7 @@ def preflight_storage(env, src, dst, bad_keys=()):
     return ok
 
 
-def inventory(env, src, manifest_path):
+def inventory(env, src, manifest_path, sanitize=False):
     """List everything that would move. Metadata only -- no object is downloaded."""
     max_bytes = int(as_num(env, "MAX_FILE_MB", float) * 1024 * 1024)
     cold_classes = {"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"}
@@ -631,7 +673,9 @@ def inventory(env, src, manifest_path):
     count, total, markers = 0, 0, 0
     by_class, hist = Counter(), defaultdict(int)
     oversize, cold = [], []
-    n_oversize = n_cold = 0
+    n_oversize = n_cold = n_badkey = 0
+    badkeys = []
+    renames = []
 
     say(f"  listing s3://{env['SOURCE_BUCKET']}/{prefix} ...")
     last_tick = time.time()
@@ -669,7 +713,14 @@ def inventory(env, src, manifest_path):
                     n_cold += 1
                     if len(cold) < EXAMPLES:
                         cold.append((key, cls))
-                writer.writerow({"key": key, "dest_key": dest_key(env, key),
+                dk = dest_key(env, key, sanitize)
+                if not SUPABASE_KEY_OK.match(dk):
+                    n_badkey += 1
+                    if len(badkeys) < EXAMPLES:
+                        badkeys.append(dk)
+                elif sanitize and dk != dest_key(env, key):
+                    renames.append((key, dk))
+                writer.writerow({"key": key, "dest_key": dk,
                                  "size": size, "storage_class": cls})
                 if count % 1000 == 0 and time.time() - last_tick > 2.0:
                     last_tick = time.time()
@@ -702,6 +753,25 @@ def inventory(env, src, manifest_path):
             say(f"      {cls:<13}  {key[:56]}")
     else:
         say("    none archived")
+
+    if n_badkey:
+        say(f"    {n_badkey:,} key(s) Supabase will REJECT (non-ASCII or other")
+        say("      characters outside its allowlist). These will fail to upload:")
+        for k in badkeys:
+            say(f"      {k[:66]}")
+        say("      Rerun with --sanitize-keys to rewrite them to ASCII.")
+    else:
+        say("    all keys valid for Supabase")
+
+    if renames:
+        mapfile = os.path.join(os.path.dirname(manifest_path) or ".", "key_renames.csv")
+        with open(mapfile, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["original_key", "sanitized_key"])
+            w.writerows(renames)
+        say("")
+        say(f"  {len(renames):,} key(s) renamed -> {mapfile}")
+        say("  Update any database rows that reference the old paths.")
 
     say(f"\n  manifest -> {manifest_path} ({count:,} rows)")
     return count
@@ -855,7 +925,7 @@ def verify_storage(env, src, dst):
     return clean
 
 
-def migrate_storage(env, state_dir, dry_run, verify_only, workers):
+def migrate_storage(env, state_dir, dry_run, verify_only, workers, sanitize=False):
     head("STORAGE  Amazon S3 -> Supabase Storage")
     require(env, STORAGE_KEYS, "storage")
 
@@ -871,7 +941,7 @@ def migrate_storage(env, state_dir, dry_run, verify_only, workers):
     state = os.path.join(state_dir, "s3_migrated.jsonl")
 
     say("")
-    count = inventory(env, src, manifest)
+    count = inventory(env, src, manifest, sanitize)
     if not count:
         say("\n  nothing to migrate")
         return True
@@ -971,6 +1041,11 @@ settings:
                          "binary (default image: dimitri/pgloader:latest).\n"
                          "Needed on Ubuntu 20.04, whose pgloader 3.6.1/3.6.2\n"
                          "cannot do the SCRAM-SHA-256 auth Supabase requires.")
+    ap.add_argument("--sanitize-keys", action="store_true",
+                    help="rewrite object keys Supabase rejects (non-ASCII and\n"
+                         "other characters outside its allowlist) to ASCII.\n"
+                         "Writes key_renames.csv so you can update database\n"
+                         "rows that reference the old paths.")
     ap.add_argument("--low-memory", action="store_true",
                     help="throttle pgloader for a small server: 2 workers,\n"
                          "1 reader, 1000-row batches and a 4 GB Lisp heap.\n"
@@ -1031,7 +1106,8 @@ settings:
         if args.only in ("storage", "all"):
             phase("storage",
                   lambda: migrate_storage(env, args.state_dir, args.dry_run,
-                                          args.verify_only, workers))
+                                          args.verify_only, workers,
+                                          args.sanitize_keys))
 
         head("SUMMARY")
         if not results:
