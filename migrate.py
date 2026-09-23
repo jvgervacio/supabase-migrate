@@ -892,7 +892,7 @@ def copy_objects(env, src, dst, manifest_path, state_path, workers):
     return counts["failed"]
 
 
-def verify_storage(env, src, dst):
+def verify_storage(env, src, dst, sanitize=False):
     def listing(client, bucket, prefix):
         out = {}
         for page in client.get_paginator("list_objects_v2").paginate(
@@ -904,7 +904,9 @@ def verify_storage(env, src, dst):
 
     source = listing(src, env["SOURCE_BUCKET"], env.get("SOURCE_PREFIX", "").lstrip("/"))
     target = listing(dst, env["TARGET_BUCKET"], env.get("TARGET_PREFIX", "").strip().strip("/"))
-    expected = {dest_key(env, k): v for k, v in source.items()}
+    # Must mirror the mapping used for the upload, or renamed keys read as
+    # missing even though they arrived.
+    expected = {dest_key(env, k, sanitize): v for k, v in source.items()}
 
     missing = {k: v for k, v in expected.items() if k not in target}
     wrong = {k: (v, target[k]) for k, v in expected.items()
@@ -935,7 +937,7 @@ def migrate_storage(env, state_dir, dry_run, verify_only, workers, sanitize=Fals
 
     if verify_only:
         say("")
-        return verify_storage(env, src, dst)
+        return verify_storage(env, src, dst, sanitize)
 
     manifest = os.path.join(state_dir, "s3_inventory.csv")
     state = os.path.join(state_dir, "s3_migrated.jsonl")
@@ -954,7 +956,7 @@ def migrate_storage(env, state_dir, dry_run, verify_only, workers, sanitize=Fals
     say("")
     failed = copy_objects(env, src, dst, manifest, state, workers)
     say("")
-    clean = verify_storage(env, src, dst)
+    clean = verify_storage(env, src, dst, sanitize)
     return failed == 0 and clean
 
 
