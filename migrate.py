@@ -859,7 +859,7 @@ def copy_objects(env, src, dst, manifest_path, state_path, workers):
                 if attempt == 3:
                     with lock:
                         counts["failed"] += 1
-                        failures.append((key, repr(e), traceback.format_exc()))
+                        failures.append((key, repr(e), traceback.format_exc(), size))
                     if DEBUG:
                         say(f"    FAILED {key}\n{traceback.format_exc()}")
                 else:
@@ -878,7 +878,7 @@ def copy_objects(env, src, dst, manifest_path, state_path, workers):
                 except Exception as e:
                     with lock:
                         counts["failed"] += 1
-                        failures.append(("<worker>", repr(e), traceback.format_exc()))
+                        failures.append(("<worker>", repr(e), traceback.format_exc(), 0))
                 prog.tick(i, counts["bytes"],
                           extra=f"ok={counts['copied']:,} skip={counts['skipped']:,} "
                                 f"fail={counts['failed']:,}",
@@ -892,12 +892,23 @@ def copy_objects(env, src, dst, manifest_path, state_path, workers):
     if failures:
         fail_log = os.path.join(os.path.dirname(state_path) or ".", "failures.log")
         with open(fail_log, "w", encoding="utf-8") as fh:
-            for key, err, tb in failures:
+            for key, err, tb, _sz in failures:
                 fh.write(f"--- {key}\n{mask(tb)}\n")
         say(f"\n  first {min(5, len(failures))} of {len(failures):,} failure(s):")
-        for key, err, _ in failures[:5]:
-            say(f"    {key[:60]}")
+        for key, err, _, sz in failures[:5]:
+            say(f"    {human(sz):>10}  {key[:58]}")
             say(f"      {err[:110]}")
+
+        # Every failure being a large file points at the bucket's size limit,
+        # not at anything the transfer did -- Supabase rejects the upload with
+        # an error that reaches boto3 as an empty code.
+        sized = [sz for _, _, _, sz in failures if sz]
+        if sized and min(sized) > 20 * 1024 * 1024:
+            say(f"\n  Every failure is a large file (smallest {human(min(sized))}).")
+            say("  That is the bucket's file size limit, not the key or the network.")
+            say("  Raise it in Storage > Buckets > your bucket > file size limit.")
+            say("  The plan caps it too: 50 MB on Free, up to 500 GB on Pro/Team.")
+
         say(f"\n  full tracebacks -> {fail_log}")
         say(f"  rerun to retry the {counts['failed']:,} failure(s); "
             f"add --debug to see stacks live")
