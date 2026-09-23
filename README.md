@@ -208,6 +208,7 @@ Secrets are masked in all console output and in the transcript.
 |---|---|---|
 | MySQL connection times out | Firewall dropping 3306 | Run on the DB server with `MYSQL_HOST=127.0.0.1`, or use an SSH tunnel |
 | pgloader fails on the Supabase side | Port 6543 | Use `SUPABASE_DB_PORT=5432` |
+| `28P01 password authentication failed` | `SUPABASE_DB_PASSWORD` is wrong — usually another project's, or an `eyJ...` API key | Project Settings → Database → Reset database password |
 | `SignatureDoesNotMatch` | The secret does not match the key id | Re-copy it; check the length (AWS 40, Supabase 64) |
 | `NoSuchBucket` on a bucket you can see | Virtual-host addressing | Already handled by the client config |
 | `403 Forbidden` on the source | Missing IAM permissions | Attach the policy above |

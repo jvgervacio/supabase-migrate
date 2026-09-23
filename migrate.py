@@ -351,6 +351,14 @@ def preflight_db(env, docker_image=None, binary="pgloader"):
         say("      Port 6543 is transaction mode: no session SET, no prepared")
         say("      statements. pgloader needs both. Use SUPABASE_DB_PORT=5432.")
 
+    # An anon/service_role key is the value nearest to hand in the dashboard and
+    # is not a database password. Postgres rejects it as a plain bad password,
+    # so without this the run dies a minute later with nothing to go on.
+    if env.get("SUPABASE_DB_PASSWORD", "").startswith("eyJ"):
+        ok = False
+        say("  supabase password -- that is an API key (a JWT), not the database")
+        say("      password. Project Settings > Database > Reset database password.")
+
     if docker_image:
         if not shutil.which("docker"):
             ok = False
@@ -434,6 +442,11 @@ def migrate_db(env, state_dir, dry_run, docker_image=None, binary="pgloader"):
     # could not reach, or a run whose summary reports per-table errors.
     errors = len(re.findall(r"^\S+\s+ERROR", out, re.M))
     unreachable = "Failed to connect" in out
+    # pgloader wraps a refused password in the same "Failed to connect" wording
+    # it uses for an unreachable host, which sends people to check firewalls.
+    # The socket opened and the server answered -- only the credentials failed.
+    refused = bool(re.search(r"28P01|password authentication failed"
+                             r"|Access denied for user", out))
     failed = proc.returncode != 0 or unreachable or errors > 0
 
     if "fell through ECASE" in out:
@@ -443,6 +456,25 @@ def migrate_db(env, state_dir, dry_run, docker_image=None, binary="pgloader"):
         say("  auth type 10 -- SCRAM-SHA-256 -- which its bundled library cannot do.")
         say("  Ubuntu ships 3.6.1/3.6.2; SCRAM needs a newer build. Rerun with:")
         say("      python3 migrate.py --env <envfile> --only db --pgloader-docker")
+    elif refused:
+        pg = "28P01" in out or "to pgsql at" in out
+        if pg:
+            say("  Supabase REFUSED THE PASSWORD. The host is reachable -- preflight")
+            say("  proved that -- so the problem is SUPABASE_DB_PASSWORD, not the")
+            say("  network. In order of how often it turns out to be each one:")
+            say("    - It belongs to a different project. Changing the project ref")
+            say("      in SUPABASE_DB_USER needs that project's password too; they")
+            say("      are not interchangeable.")
+            say("    - It is an API key, not the database password. A value starting")
+            say("      'eyJ' is an anon/service_role JWT and will never work here.")
+            say("    - It is stale or unknown. Reset it, no data is affected:")
+            say("      Dashboard > Project Settings > Database > Reset database password")
+            say("    - It was percent-encoded by hand. Paste it raw -- encoding is")
+            say("      done for you, and doing it twice turns '%' into '%25'.")
+        else:
+            say("  MySQL REFUSED THE PASSWORD -- check MYSQL_USER and MYSQL_PASSWORD.")
+            say("  A grant made for 'user'@'localhost' does not cover 127.0.0.1 and")
+            say("  vice versa; SHOW GRANTS FOR CURRENT_USER shows what exists.")
     elif unreachable:
         say("  pgloader could not reach one of the databases.")
     if errors:
@@ -958,10 +990,12 @@ def verify_storage(env, src, dst, sanitize=False):
     say(f"  destination  {len(target):,} files   {human(sum(target.values()))}")
     say(f"  missing      {len(missing):,}")
     say(f"  wrong size   {len(wrong):,}")
+    # Print keys whole. Clipping them to a column width silently turned a
+    # '.pptx' into a '.ppt' here, which reads as a different file entirely.
     for k in list(missing)[:10]:
-        say(f"    missing  {human(missing[k]):>10}  {k[:50]}")
+        say(f"    missing  {human(missing[k]):>10}  {k}")
     for k, (a, b) in list(wrong.items())[:10]:
-        say(f"    size     {human(a):>10} != {human(b):>10}  {k[:40]}")
+        say(f"    size     {human(a):>10} != {human(b):>10}  {k}")
 
     clean = not missing and not wrong
     say("  all files present with matching sizes" if clean
