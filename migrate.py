@@ -793,14 +793,25 @@ def copy_objects(env, src, dst, manifest_path, state_path, workers):
     cfg = TransferConfig(multipart_threshold=8 * 1024 * 1024,
                          multipart_chunksize=16 * 1024 * 1024, max_concurrency=2)
 
-    done = set()
+    # The resume log records which bucket pair each key was copied for. Without
+    # it, two buckets sharing a state directory skip each other's identically
+    # named objects -- silently leaving files unmigrated.
+    pair = f"{env['SOURCE_BUCKET']}->{env['TARGET_BUCKET']}"
+    done, legacy = set(), 0
     if os.path.exists(state_path):
         with open(state_path, encoding="utf-8") as f:
             for line in f:
                 try:
-                    done.add(json.loads(line)["key"])
+                    rec = json.loads(line)
                 except Exception:
-                    pass
+                    continue
+                if rec.get("pair") == pair:
+                    done.add(rec["key"])
+                elif "pair" not in rec:
+                    legacy += 1          # written before pairs were recorded
+    if legacy:
+        say(f"  note: {legacy:,} older state entries predate bucket tracking and")
+        say("        are ignored; those objects are re-checked by size instead.")
 
     with open(manifest_path, encoding="utf-8") as f:
         plan = list(csv.DictReader(f))
@@ -840,7 +851,8 @@ def copy_objects(env, src, dst, manifest_path, state_path, workers):
                 with lock:
                     counts["copied"] += 1
                     counts["bytes"] += size
-                    statefile.write(json.dumps({"key": key, "size": size}) + "\n")
+                    statefile.write(
+                        json.dumps({"key": key, "size": size, "pair": pair}) + "\n")
                     statefile.flush()      # survive a kill -9 mid-run
                 return
             except Exception as e:
