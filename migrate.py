@@ -208,6 +208,25 @@ def require(env, keys, what):
         raise Fatal(f"{what}: still template placeholders: {', '.join(todo)}")
 
 
+def check_same_project(env):
+    """The database and storage settings must name one Supabase project.
+
+    Mixing them is how a staging run ends up writing into the production
+    bucket -- worth stopping before anything is transferred."""
+    m_db = re.match(r"postgres\.([a-z0-9]{16,})$", env.get("SUPABASE_DB_USER", ""))
+    m_s3 = re.match(r"https://([a-z0-9]{16,})\.storage\.supabase\.co",
+                    env.get("SUPABASE_S3_ENDPOINT", ""))
+    if m_db and m_s3 and m_db.group(1) != m_s3.group(1):
+        raise Fatal(
+            "SUPABASE_DB_USER and SUPABASE_S3_ENDPOINT name DIFFERENT projects:\n"
+            f"    database -> {m_db.group(1)}\n"
+            f"    storage  -> {m_s3.group(1)}\n"
+            "  One of them is wrong. Migrating with these would put the database\n"
+            "  in one project and the files in another -- and if the S3 keys\n"
+            "  happen to match the endpoint, into a project you did not intend.\n"
+            "  Fix the env file, or pass --allow-split-project if this is deliberate.")
+
+
 def as_num(env, key, cast=int):
     """Numeric setting or a clean error -- not a traceback from int('abc')."""
     raw = str(env.get(key, "")).strip()
@@ -1076,6 +1095,11 @@ settings:
                          "1 reader, 1000-row batches and a 4 GB Lisp heap.\n"
                          "Use when the data copy dies with 'Heap exhausted'\n"
                          "or the OOM killer. Slower, far less memory.")
+    ap.add_argument("--allow-split-project", action="store_true",
+                    help="permit SUPABASE_DB_USER and SUPABASE_S3_ENDPOINT to\n"
+                         "name different Supabase projects. Refused by default:\n"
+                         "it is usually a half-edited env file pointing at a\n"
+                         "project you did not mean to write to.")
     ap.add_argument("--debug", action="store_true",
                     help="print full tracebacks to the console as failures\n"
                          "happen, not only to failures.log")
@@ -1091,6 +1115,9 @@ settings:
         env = load_env(args.env)
         os.makedirs(args.state_dir, exist_ok=True)
         open_log(os.path.join(args.state_dir, "migrate.log"))
+
+        if not args.allow_split_project:
+            check_same_project(env)
 
         if args.low_memory:
             # Fill in only what the env file leaves unset, so an explicit
